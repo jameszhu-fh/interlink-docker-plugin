@@ -21,6 +21,7 @@ import (
 	commonIL "github.com/intertwin-eu/interlink-docker-plugin/pkg/common"
 	docker "github.com/intertwin-eu/interlink-docker-plugin/pkg/docker"
 	"github.com/intertwin-eu/interlink-docker-plugin/pkg/docker/dindmanager"
+	"github.com/intertwin-eu/interlink-docker-plugin/pkg/docker/fpgastrategies"
 	"github.com/intertwin-eu/interlink-docker-plugin/pkg/docker/gpustrategies"
 	"github.com/sirupsen/logrus"
 
@@ -44,15 +45,15 @@ import (
 
 func initProvider(ctx context.Context) (func(context.Context) error, error) {
 
-	log.G(ctx).Info("Tracing is enabled, setting up the TracerProvider")
+	log.G(ctx).Info("\u2705 Tracing is enabled, setting up the TracerProvider")
 
 	// Get the TELEMETRY_UNIQUE_ID from the environment, if it is not set, use the hostname
 	uniqueID := os.Getenv("TELEMETRY_UNIQUE_ID")
 	if uniqueID == "" {
-		//log.G(ctx).Info("No TELEMETRY_UNIQUE_ID set, generating a new one")
+		log.G(ctx).Info("No TELEMETRY_UNIQUE_ID set, generating a new one")
 		newUUID := uuid.New()
 		uniqueID = newUUID.String()
-		//log.G(ctx).Info("Generated unique ID: ", uniqueID, " use Plugin-"+uniqueID+" as service name from Grafana")
+		log.G(ctx).Info("Generated unique ID: ", uniqueID, " use Plugin-"+uniqueID+" as service name from Grafana")
 	}
 
 	serviceName := "Plugin-" + uniqueID
@@ -76,7 +77,7 @@ func initProvider(ctx context.Context) (func(context.Context) error, error) {
 		otlpEndpoint = "localhost:4317"
 	}
 
-	log.G(ctx).Info("TELEMETRY_ENDPOINT: ", otlpEndpoint)
+	log.G(ctx).Info("\u2705 TELEMETRY_ENDPOINT: ", otlpEndpoint)
 
 	caCrtFilePath := os.Getenv("TELEMETRY_CA_CRT_FILEPATH")
 
@@ -85,7 +86,7 @@ func initProvider(ctx context.Context) (func(context.Context) error, error) {
 
 		// if the CA certificate is provided, set up mutual TLS
 
-		//log.G(ctx).Info("CA certificate provided, setting up mutual TLS")
+		log.G(ctx).Info("CA certificate provided, setting up mutual TLS")
 
 		caCert, err := ioutil.ReadFile(caCrtFilePath)
 		if err != nil {
@@ -150,7 +151,7 @@ func initProvider(ctx context.Context) (func(context.Context) error, error) {
 	// set global propagator to tracecontext (the default is no-op).
 	otel.SetTextMapPropagator(propagation.TraceContext{})
 
-	log.G(ctx).Info("Tracing setup complete")
+	log.G(ctx).Info("\u2705 Tracing setup complete")
 
 	return tracerProvider.Shutdown, nil
 }
@@ -160,7 +161,7 @@ func main() {
 
 	interLinkConfig, err := commonIL.NewInterLinkConfig()
 	if err != nil {
-		//log.G(context.Background()).Fatal(err)
+		log.G(context.Background()).Fatal(err)
 	}
 
 	if interLinkConfig.VerboseLogging {
@@ -174,42 +175,40 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var gpuManager gpustrategies.GPUManagerInterface
-	gpuManager = &gpustrategies.GPUManager{
+	availableDinds := os.Getenv("AVAILABLEDINDS")
+	if availableDinds == "" {
+		availableDinds = "2"
+	}
+	var dindHandler dindmanager.DindManagerInterface = &dindmanager.DindManager{
+		DindList: []dindmanager.DindSpecs{},
+		Ctx:      ctx,
+	}
+	availableDindsInt, err := strconv.ParseInt(availableDinds, 10, 8)
+	if err != nil {
+		log.G(ctx).Info("\u2705 Error parsing availableDinds")
+	}
+	dindHandler.CleanDindContainers()
+	dindHandler.BuildDindContainers(int8(availableDindsInt))
+
+	var gpuManager gpustrategies.GPUManagerInterface = &gpustrategies.GPUManager{
 		GPUSpecsList: []gpustrategies.GPUSpecs{},
 		Ctx:          ctx,
 	}
 
 	err = gpuManager.Init()
 	if err != nil {
-		//log.G(ctx).Fatal(err)
+		log.G(ctx).Info("\u274C Init of GPUs failed, error", err)
 	}
 
 	err = gpuManager.Discover()
 	if err != nil {
-		//log.G(ctx).Fatal(err)
+		log.G(ctx).Info("\u274C Discover of GPUs failed, error: ", err)
 	}
 
 	err = gpuManager.Check()
 	if err != nil {
-		//log.G(ctx).Fatal(err)
+		log.G(ctx).Info("\u274C Check of GPUs failed, error: ", err)
 	}
-
-	availableDinds := os.Getenv("AVAILABLEDINDS")
-	if availableDinds == "" {
-		availableDinds = "2"
-	}
-	var dindHandler dindmanager.DindManagerInterface
-	dindHandler = &dindmanager.DindManager{
-		DindList: []dindmanager.DindSpecs{},
-		Ctx:      ctx,
-	}
-	availableDindsInt, err := strconv.ParseInt(availableDinds, 10, 8)
-	if err != nil {
-		//log.G(ctx).Fatal(err)
-	}
-	dindHandler.CleanDindContainers()
-	dindHandler.BuildDindContainers(int8(availableDindsInt))
 
 	SidecarAPIs := docker.SidecarHandler{
 		Config:      interLinkConfig,
@@ -218,25 +217,43 @@ func main() {
 		DindManager: dindHandler,
 	}
 
-	//log.G(ctx).Info(fmt.Sprintf("\u2705 Start cleaning zombie DIND containers"))
+	log.G(ctx).Info("\u2705 Start cleaning zombie DIND containers")
 
 	if os.Getenv("ENABLE_TRACING") == "1" {
 		shutdown, err := initProvider(ctx)
 		if err != nil {
-			//log.G(ctx).Fatal(err)
+			log.G(ctx).Fatal("\u274C failed to initialize TracerProvider: %w", err)
 		}
 		defer func() {
 			if err = shutdown(ctx); err != nil {
-				//log.G(ctx).Fatal("failed to shutdown TracerProvider: %w", err)
+				log.G(ctx).Fatal("\u274C failed to shutdown TracerProvider: %w", err)
 			}
 		}()
 
-		//log.G(ctx).Info(fmt.Sprintf("\u2705 Tracing is enabled"))
+		log.G(ctx).Info("\u2705 Tracing is enabled")
 		// TODO: disable this through options
 		trace.T = opentelemetry.Adapter{}
 	} else {
-		//log.G(ctx).Info("Tracing is disabled")
+		log.G(ctx).Info("\u2705 Tracing is disabled")
 	}
+
+	if os.Getenv("FPGAENABLED") == "1" {
+		fpgaManager := &fpgastrategies.FPGAManager{
+			FPGASpecsList: []fpgastrategies.FPGASpecs{},
+			Ctx:           ctx,
+		}
+		err = fpgaManager.Init()
+		if err != nil {
+			log.G(ctx).Fatal("\u274C Error during fpga init: %w", err)
+		}
+
+		err = fpgaManager.Discover()
+		if err != nil {
+			log.G(ctx).Fatal("\u274C Error during fpga discover: %w", err)
+		}
+	}
+
+	log.G(ctx).Info(fmt.Sprintf("\u2705 Going to start the sidecar on port %s", interLinkConfig.Sidecarport))
 
 	mutex := http.NewServeMux()
 	mutex.HandleFunc("/status", SidecarAPIs.StatusHandler)
@@ -263,19 +280,19 @@ func main() {
 			Handler: mutex,
 		}
 
-		//log.G(ctx).Info(socket)
+		log.G(ctx).Info(socket)
 
 		if err := server.Serve(socket); err != nil {
-			//log.G(ctx).Fatal(err)
+			log.G(ctx).Fatal(err)
 		}
 	} else {
 		err = http.ListenAndServe(":"+interLinkConfig.Sidecarport, mutex)
 		if err != nil {
-			//log.G(ctx).Fatal(err)
+			log.G(ctx).Fatal(err)
 		}
 	}
 
 	if err != nil {
-		//log.G(ctx).Fatal(err)
+		log.G(ctx).Fatal(err)
 	}
 }

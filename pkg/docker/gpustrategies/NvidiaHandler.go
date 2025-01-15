@@ -9,7 +9,9 @@ import (
 	"strings"
 
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
-	"github.com/containerd/containerd/log"
+	"github.com/containerd/log"
+
+	//"github.com/containerd/containerd/log"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 
@@ -103,8 +105,8 @@ func (a *GPUManager) Discover() error {
 
 func (a *GPUManager) Check() error {
 
-	cli, err := client.NewEnvClient()
-	//cli, err := client.NewClientWithOpts(client.WithVersion("1.44"))
+	//cli, err := client.NewEnvClient()
+	cli, err := client.NewClientWithOpts(client.WithVersion("1.44"))
 	if err != nil {
 		return fmt.Errorf("unable to create a new Docker client: %v", err)
 	}
@@ -122,6 +124,7 @@ func (a *GPUManager) Check() error {
 
 		for _, env := range containerInfo.Config.Env {
 			if strings.Contains(env, "NVIDIA_VISIBLE_DEVICES=") {
+
 				indexOfEqualSign := strings.Index(env, "=")
 				gpuIDs := env[indexOfEqualSign+1:]
 				gpuIDsSplitted := strings.Split(gpuIDs, ",")
@@ -129,7 +132,8 @@ func (a *GPUManager) Check() error {
 				for _, gpuID := range gpuIDsSplitted {
 					gpuIndex, err := strconv.Atoi(gpuID)
 					if err != nil {
-						return fmt.Errorf("unable to convert GPU ID to int: %v", err)
+						fmt.Errorf("unable to convert GPU ID to int: %v", err)
+						continue
 					}
 					for i := range a.GPUSpecsList {
 						if a.GPUSpecsList[i].Index == gpuIndex {
