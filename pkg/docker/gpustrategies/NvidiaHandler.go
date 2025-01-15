@@ -104,6 +104,7 @@ func (a *GPUManager) Discover() error {
 func (a *GPUManager) Check() error {
 
 	cli, err := client.NewEnvClient()
+	//cli, err := client.NewClientWithOpts(client.WithVersion("1.44"))
 	if err != nil {
 		return fmt.Errorf("unable to create a new Docker client: %v", err)
 	}
