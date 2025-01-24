@@ -29,6 +29,7 @@ func (h *SidecarHandler) prepareDockerRuns(podData commonIL.RetrievedPodData, w 
 
 	var dockerRunStructs []DockerRunStruct
 	var gpuArgs string = ""
+	var fpgaArgs string = ""
 
 	podUID := string(podData.Pod.UID)
 	podNamespace := string(podData.Pod.Namespace)
@@ -83,6 +84,7 @@ func (h *SidecarHandler) prepareDockerRuns(podData commonIL.RetrievedPodData, w 
 			containerName := podNamespace + "-" + podUID + "-" + container.Name
 
 			var isGpuRequested bool = false
+			var isFPGARequested bool = false
 			var additionalGpuArgs []string
 
 			if val, ok := container.Resources.Limits["nvidia.com/gpu"]; ok {
@@ -127,6 +129,32 @@ func (h *SidecarHandler) prepareDockerRuns(podData commonIL.RetrievedPodData, w 
 
 			}
 
+			if val, ok := container.Resources.Limits["xilinx.com/fpga"]; ok {
+				numFPGAsRequested := val.Value()
+				if numFPGAsRequested == 0 {
+					log.G(h.Ctx).Info("\u2705 Container " + containerName + " is not requesting a FPGA")
+				} else {
+
+					isFPGARequested = true
+					log.G(h.Ctx).Info("\u2705 Container " + containerName + " is requesting " + strconv.Itoa(int(numFPGAsRequested)) + " FPGA(s)")
+
+					numFPGAsRequestedInt := int(numFPGAsRequested)
+					_, err := h.FPGAManager.GetAvailableFPGAs(numFPGAsRequestedInt)
+					if err != nil {
+						HandleErrorAndRemoveData(h, w, "An error occurred during the request of available FPGAs", err, podNamespace, podUID)
+						return dockerRunStructs, errors.New("An error occurred during the request of available FPGAs")
+					}
+					assignedFPGAs, err := h.FPGAManager.GetAndAssignAvailableFPGAs(numFPGAsRequestedInt, containerName)
+					if err != nil {
+						HandleErrorAndRemoveData(h, w, "An error occurred during request of get and assign of an available GPU", err, podNamespace, podUID)
+						return dockerRunStructs, errors.New("An error occurred during request of get and assign of an available GPU")
+					}
+					for _, fpgaSpec := range assignedFPGAs {
+						fpgaArgs += " --device=" + fpgaSpec.DeviceToMount + ":" + fpgaSpec.DeviceToMount
+					}
+				}
+			}
+
 			var envVars string = ""
 			for _, envVar := range container.Env {
 				if envVar.Value != "" {
@@ -169,6 +197,10 @@ func (h *SidecarHandler) prepareDockerRuns(podData commonIL.RetrievedPodData, w 
 
 			if isGpuRequested {
 				cmd = append(cmd, additionalGpuArgs...)
+			}
+
+			if isFPGARequested {
+				cmd = append(cmd, fpgaArgs)
 			}
 
 			var additionalPortArgs []string
@@ -240,6 +272,7 @@ func (h *SidecarHandler) prepareDockerRuns(podData commonIL.RetrievedPodData, w 
 				Command:         "docker " + strings.Join(shell.Args, " "),
 				IsInitContainer: isInitContainer,
 				GpuArgs:         gpuArgs,
+				FpgaArgs:        fpgaArgs,
 			})
 		}
 	}
