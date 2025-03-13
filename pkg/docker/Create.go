@@ -409,10 +409,16 @@ func (h *SidecarHandler) CreateHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
+			routeIP := strings.Split(podIpAddress, ".")
+			routeIP[3] = "251"
+			route := strings.Join(routeIP, ".")
+
+			log.G(h.Ctx).Info("\u2705 [POD FLOW] Route IP is: " + route)
+
 			// inside the dind container, add the route to the pod IP ip route add 10.0.0.0/8  via 10.244.12.251
 			shell = exec.ExecTask{
 				Command: "docker",
-				Args:    []string{"exec", dindContainerID, "ip", "route", "add", "10.0.0.0/8", "via", "10.244.12.251"},
+				Args:    []string{"exec", dindContainerID, "ip", "route", "add", "10.0.0.0/8", "via", route},
 				Shell:   true,
 			}
 
