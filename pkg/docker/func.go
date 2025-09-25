@@ -25,6 +25,17 @@ type SidecarHandler struct {
 	FPGAManager fpgastrategies.FPGAManagerInterface
 }
 
+func escapeDockerArgs(args []string) []string {
+	escapedArgs := make([]string, 0, len(args))
+	for _, arg := range args {
+		if strings.ContainsAny(arg, " &;*$") {
+			arg = `"` + strings.ReplaceAll(arg, `"`, `\"`) + `"`
+		}
+		escapedArgs = append(escapedArgs, arg)
+	}
+	return escapedArgs
+}
+
 func parseContainerCommandAndReturnArgs(Ctx context.Context, config commonIL.InterLinkConfig, podUID string, podNamespace string, container v1.Container) ([]string, []string, []string, error) {
 
 	dirPath := config.DataRootFolder + podNamespace + "-" + podUID

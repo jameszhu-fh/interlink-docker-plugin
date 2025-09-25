@@ -123,8 +123,8 @@ func (h *SidecarHandler) prepareDockerRuns(podData commonIL.RetrievedPodData, w 
 						}
 					}
 
-					additionalGpuArgs = append(additionalGpuArgs, "--runtime=nvidia -e NVIDIA_VISIBLE_DEVICES="+gpuUUIDs)
-					gpuArgs = "--runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=" + gpuUUIDs
+					gpuArgs = "--gpus '\"device=" + gpuUUIDs + "\"'"
+					additionalGpuArgs = append(additionalGpuArgs, gpuArgs)
 				}
 
 			}
@@ -200,7 +200,7 @@ func (h *SidecarHandler) prepareDockerRuns(podData commonIL.RetrievedPodData, w 
 			}
 
 			//envVars += " --network=host"
-			cmd := []string{"run", "--user", "root", "-d", "--name", containerName}
+			cmd := []string{"run", "-d", "--name", containerName}
 
 			cmd = append(cmd, envVars)
 
@@ -277,28 +277,18 @@ func (h *SidecarHandler) prepareDockerRuns(podData commonIL.RetrievedPodData, w 
 				cmd = append(cmd, mountFileCommand...)
 			}
 
-			cmd = append(cmd, container.Image)
-			cmd = append(cmd, containerCommands...)
-			cmd = append(cmd, containerArgs...)
-
-			dockerOptions := ""
-
 			if dockerFlags, ok := podData.Pod.ObjectMeta.Annotations["docker-options.vk.io/flags"]; ok {
 				parsedDockerOptions := strings.Split(dockerFlags, " ")
-				for _, option := range parsedDockerOptions {
-					dockerOptions += " " + option
-				}
+				cmd = append(cmd, parsedDockerOptions...)
 			}
 
-			shell := exec.ExecTask{
-				Command: "docker" + dockerOptions,
-				Args:    cmd,
-				Shell:   true,
-			}
+			cmd = append(cmd, container.Image)
+			cmd = append(cmd, containerCommands...)
+			cmd = append(cmd, escapeDockerArgs(containerArgs)...)
 
 			dockerRunStructs = append(dockerRunStructs, DockerRunStruct{
 				Name:            containerName,
-				Command:         "docker " + strings.Join(shell.Args, " "),
+				Command:         "docker " + strings.Join(cmd, " "),
 				IsInitContainer: isInitContainer,
 				GpuArgs:         gpuArgs,
 				FpgaArgs:        fpgaArgs,
@@ -358,8 +348,8 @@ func (h *SidecarHandler) CreateHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req []commonIL.RetrievedPodData
-	err = json.Unmarshal(bodyBytes, &req)
+	var data commonIL.RetrievedPodData
+	err = json.Unmarshal(bodyBytes, &data)
 
 	if err != nil {
 		HandleErrorAndRemoveData(h, w, "An error occurred during json unmarshal of data from pod creation request", err, "", "")
@@ -374,251 +364,247 @@ func (h *SidecarHandler) CreateHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.G(h.Ctx).Info("\u2705 [POD FLOW] Request data unmarshalled successfully and current working directory detected")
 
-	for _, data := range req {
+	podUID := string(data.Pod.UID)
+	podNamespace := string(data.Pod.Namespace)
 
-		podUID := string(data.Pod.UID)
-		podNamespace := string(data.Pod.Namespace)
+	podDirectoryPath := filepath.Join(wd, h.Config.DataRootFolder+"/"+podNamespace+"-"+podUID)
 
-		podDirectoryPath := filepath.Join(wd, h.Config.DataRootFolder+"/"+podNamespace+"-"+podUID)
+	podIpAddress := ""
+	annotations := make([]string, 0, len(data.Pod.Annotations))
+	for key, value := range data.Pod.Annotations {
+		annotations = append(annotations, key+"="+value)
 
-		podIpAddress := ""
-		annotations := make([]string, 0, len(data.Pod.Annotations))
-		for key, value := range data.Pod.Annotations {
-			annotations = append(annotations, key+"="+value)
-
-			// if the key is interlink.eu/pod-ip and the value is not empty, set the pod IP to the DIND container
-			if key == "interlink.eu/pod-ip" && value != "" {
-				podIpAddress = value
-			}
+		// if the key is interlink.eu/pod-ip and the value is not empty, set the pod IP to the DIND container
+		if key == "interlink.eu/pod-ip" && value != "" {
+			podIpAddress = value
 		}
-		log.G(h.Ctx).Info("\u2705 [POD FLOW] Pod Annotations are: " + strings.Join(annotations, ", "))
+	}
+	log.G(h.Ctx).Info("\u2705 [POD FLOW] Pod Annotations are: " + strings.Join(annotations, ", "))
 
-		log.G(h.Ctx).Info("\u2705 [POD FLOW] Pod IP Address is: " + podIpAddress)
+	log.G(h.Ctx).Info("\u2705 [POD FLOW] Pod IP Address is: " + podIpAddress)
 
-		// if podIpAddress is != "" then exec the command docker network connect vk0 --ip podIpAddress <container_name>
-		if podIpAddress != "" {
-			shell := exec.ExecTask{
-				Command: "docker",
-				Args:    []string{"network", "connect", "vk0", "--ip", podIpAddress, dindContainerID},
-				Shell:   true,
-			}
-
-			_, err = shell.Execute()
-			if err != nil {
-				HandleErrorAndRemoveData(h, w, "An error occurred during the connection of the DIND container to the vk0 network", err, "", "")
-				return
-			}
-
-			routeIP := strings.Split(podIpAddress, ".")
-			routeIP[3] = "251"
-			route := strings.Join(routeIP, ".")
-
-			log.G(h.Ctx).Info("\u2705 [POD FLOW] Route IP is: " + route)
-
-			// inside the dind container, add the route to the pod IP ip route add 10.0.0.0/8  via 10.244.12.251
-			shell = exec.ExecTask{
-				Command: "docker",
-				Args:    []string{"exec", dindContainerID, "ip", "route", "add", "10.0.0.0/8", "via", route},
-				Shell:   true,
-			}
-
-			_, err = shell.Execute()
-			if err != nil {
-				HandleErrorAndRemoveData(h, w, "An error occurred during the addition of the route to the pod IP", err, "", "")
-				return
-			}
-
-			// exec the command echo "nameserver 10.96.0.10" > /etc/resolv.conf
-			// shell = exec.ExecTask{
-			// 	Command: "docker",
-			// 	Args:    []string{"exec", dindContainerID, "-u", "0", "sh", "-c", "echo 'nameserver 10.96.0.10' > /etc/resolv.conf"},
-			// 	Shell:   true,
-			// }
-
-			// log.G(h.Ctx).Info("\u2705 [POD FLOW] Executing command to add nameserver to resolv.conf file")
-			// log.G(h.Ctx).Info("\u2705 [POD FLOW] Command: " + "docker " + strings.Join(shell.Args, " "))
-
-			// _, err = shell.Execute()
-			// if err != nil {
-			// 	HandleErrorAndRemoveData(h, w, "An error occurred during the addition of the nameserver to the resolv.conf file", err, "", "")
-			// 	return
-			// }
-
-			// log.G(h.Ctx).Info("\u2705 [POD FLOW] Nameserver added to resolv.conf file")
-
-		}
-
-		// if the podDirectoryPath does not exist, create it
-		if _, err := os.Stat(podDirectoryPath); os.IsNotExist(err) {
-			err = os.MkdirAll(podDirectoryPath, os.ModePerm)
-			if err != nil {
-				HandleErrorAndRemoveData(h, w, "An error occurred during the creation of the pod directory", err, "", "")
-				return
-			}
-		}
-
-		// call prepareDockerRuns to get the DockerRunStruct array
-		dockerRunStructs, err := h.prepareDockerRuns(data, w, podIpAddress)
-		if err != nil {
-			HandleErrorAndRemoveData(h, w, "An error occurred during preparing of docker run commmands", err, "", "")
-			return
-		}
-
-		log.G(h.Ctx).Info("\u2705 [POD FLOW] Docker run commands prepared successfully")
-
-		// from dockerRunStructs, create two arrays: one for initContainers and one for containers
-		var initContainers []DockerRunStruct
-		var containers []DockerRunStruct
-		//var gpuArgs string
-
-		for _, dockerRunStruct := range dockerRunStructs {
-			if dockerRunStruct.IsInitContainer {
-				initContainers = append(initContainers, dockerRunStruct)
-			} else {
-				containers = append(containers, dockerRunStruct)
-			}
-		}
-
-		// set the podUID to the dind container
-		err = h.DindManager.SetPodUIDToDind(dindContainerID, podUID)
-		if err != nil {
-			HandleErrorAndRemoveData(h, w, "An error occurred during the setting of the pod UID to the DIND container", err, "", "")
-			return
-		}
-
-		// run the docker command to rename the container to the pod UID
+	// if podIpAddress is != "" then exec the command docker network connect vk0 --ip podIpAddress <container_name>
+	if podIpAddress != "" {
 		shell := exec.ExecTask{
 			Command: "docker",
-			Args:    []string{"rename", dindContainerID, string(data.Pod.UID) + "_dind"},
+			Args:    []string{"network", "connect", "vk0", "--ip", podIpAddress, dindContainerID},
 			Shell:   true,
 		}
 
 		_, err = shell.Execute()
 		if err != nil {
-			HandleErrorAndRemoveData(h, w, "An error occurred during the rename of the DIND container", err, "", "")
+			HandleErrorAndRemoveData(h, w, "An error occurred during the connection of the DIND container to the vk0 network", err, "", "")
 			return
 		}
 
-		createResponse := CreateStruct{PodUID: string(data.Pod.UID), PodJID: dindContainerID}
-		createResponseBytes, err := json.Marshal(createResponse)
+		routeIP := strings.Split(podIpAddress, ".")
+		routeIP[3] = "251"
+		route := strings.Join(routeIP, ".")
+
+		log.G(h.Ctx).Info("\u2705 [POD FLOW] Route IP is: " + route)
+
+		// inside the dind container, add the route to the pod IP ip route add 10.0.0.0/8  via 10.244.12.251
+		shell = exec.ExecTask{
+			Command: "docker",
+			Args:    []string{"exec", dindContainerID, "ip", "route", "add", "10.0.0.0/8", "via", route},
+			Shell:   true,
+		}
+
+		_, err = shell.Execute()
 		if err != nil {
-			statusCode = http.StatusInternalServerError
-			HandleErrorAndRemoveData(h, w, "An error occurred during the json marshal of the returned JID", err, "", "")
+			HandleErrorAndRemoveData(h, w, "An error occurred during the addition of the route to the pod IP", err, "", "")
 			return
 		}
 
-		span.SetAttributes(attribute.String("podUID", string(data.Pod.UID)))
-		span.SetAttributes(attribute.String("podJID", dindContainerID))
-		span.SetAttributes(attribute.String("podNamespace", string(data.Pod.Namespace)))
-		span.SetAttributes(attribute.String("podName", string(data.Pod.Name)))
+		// exec the command echo "nameserver 10.96.0.10" > /etc/resolv.conf
+		// shell = exec.ExecTask{
+		// 	Command: "docker",
+		// 	Args:    []string{"exec", dindContainerID, "-u", "0", "sh", "-c", "echo 'nameserver 10.96.0.10' > /etc/resolv.conf"},
+		// 	Shell:   true,
+		// }
 
-		w.WriteHeader(statusCode)
+		// log.G(h.Ctx).Info("\u2705 [POD FLOW] Executing command to add nameserver to resolv.conf file")
+		// log.G(h.Ctx).Info("\u2705 [POD FLOW] Command: " + "docker " + strings.Join(shell.Args, " "))
 
-		if statusCode != http.StatusOK {
-			w.Write([]byte("Some errors occurred while creating containers. Check Docker Sidecar's logs"))
+		// _, err = shell.Execute()
+		// if err != nil {
+		// 	HandleErrorAndRemoveData(h, w, "An error occurred during the addition of the nameserver to the resolv.conf file", err, "", "")
+		// 	return
+		// }
+
+		// log.G(h.Ctx).Info("\u2705 [POD FLOW] Nameserver added to resolv.conf file")
+
+	}
+
+	// if the podDirectoryPath does not exist, create it
+	if _, err := os.Stat(podDirectoryPath); os.IsNotExist(err) {
+		err = os.MkdirAll(podDirectoryPath, os.ModePerm)
+		if err != nil {
+			HandleErrorAndRemoveData(h, w, "An error occurred during the creation of the pod directory", err, "", "")
+			return
+		}
+	}
+
+	// call prepareDockerRuns to get the DockerRunStruct array
+	dockerRunStructs, err := h.prepareDockerRuns(data, w, podIpAddress)
+	if err != nil {
+		HandleErrorAndRemoveData(h, w, "An error occurred during preparing of docker run commmands", err, "", "")
+		return
+	}
+
+	log.G(h.Ctx).Info("\u2705 [POD FLOW] Docker run commands prepared successfully")
+
+	// from dockerRunStructs, create two arrays: one for initContainers and one for containers
+	var initContainers []DockerRunStruct
+	var containers []DockerRunStruct
+	//var gpuArgs string
+
+	for _, dockerRunStruct := range dockerRunStructs {
+		if dockerRunStruct.IsInitContainer {
+			initContainers = append(initContainers, dockerRunStruct)
 		} else {
-			w.Write(createResponseBytes)
+			containers = append(containers, dockerRunStruct)
 		}
+	}
 
-		if err != nil {
-			span.SetAttributes(attribute.String("error", err.Error()))
-		}
-		commonIL.SetDurationSpan(start, span, commonIL.WithHTTPReturnCode(statusCode))
-		span.End()
+	// set the podUID to the dind container
+	err = h.DindManager.SetPodUIDToDind(dindContainerID, podUID)
+	if err != nil {
+		HandleErrorAndRemoveData(h, w, "An error occurred during the setting of the pod UID to the DIND container", err, "", "")
+		return
+	}
 
-		go func() {
+	// run the docker command to rename the container to the pod UID
+	shell := exec.ExecTask{
+		Command: "docker",
+		Args:    []string{"rename", dindContainerID, string(data.Pod.UID) + "_dind"},
+		Shell:   true,
+	}
 
-			if len(initContainers) > 0 {
+	_, err = shell.Execute()
+	if err != nil {
+		HandleErrorAndRemoveData(h, w, "An error occurred during the rename of the DIND container", err, "", "")
+		return
+	}
 
-				log.G(h.Ctx).Info("\u2705 [POD FLOW] Start creating init containers")
+	createResponse := CreateStruct{PodUID: string(data.Pod.UID), PodJID: dindContainerID}
+	createResponseBytes, err := json.Marshal(createResponse)
+	if err != nil {
+		statusCode = http.StatusInternalServerError
+		HandleErrorAndRemoveData(h, w, "An error occurred during the json marshal of the returned JID", err, "", "")
+		return
+	}
 
-				// Create a list to hold the docker run commands
-				var initContainerCommands []string
+	span.SetAttributes(attribute.String("podUID", string(data.Pod.UID)))
+	span.SetAttributes(attribute.String("podJID", dindContainerID))
+	span.SetAttributes(attribute.String("podNamespace", string(data.Pod.Namespace)))
+	span.SetAttributes(attribute.String("podName", string(data.Pod.Name)))
 
-				// Build the docker run commands for each init container
-				for _, initContainer := range initContainers {
-					initContainerCommands = append(initContainerCommands, initContainer.Command+"\n")
+	w.WriteHeader(statusCode)
+
+	if statusCode != http.StatusOK {
+		w.Write([]byte("Some errors occurred while creating containers. Check Docker Sidecar's logs"))
+	} else {
+		w.Write(createResponseBytes)
+	}
+
+	if err != nil {
+		span.SetAttributes(attribute.String("error", err.Error()))
+	}
+	commonIL.SetDurationSpan(start, span, commonIL.WithHTTPReturnCode(statusCode))
+	span.End()
+
+	go func() {
+
+		if len(initContainers) > 0 {
+
+			log.G(h.Ctx).Info("\u2705 [POD FLOW] Start creating init containers")
+
+			// Create a list to hold the docker run commands
+			var initContainerCommands []string
+
+			// Build the docker run commands for each init container
+			for _, initContainer := range initContainers {
+				initContainerCommands = append(initContainerCommands, initContainer.Command+"\n")
+			}
+
+			// Log the init container commands
+			log.G(h.Ctx).Info("\u2705 [POD FLOW] Init containers command list: " + strings.Join(initContainerCommands, ", "))
+
+			// Run init containers sequentially
+			for _, initContainer := range initContainers {
+				log.G(h.Ctx).Info("\u2705 [POD FLOW] Executing init container: " + initContainer.Name)
+
+				// Execute the docker command for the current init container
+				shell := exec.ExecTask{
+					Command: "docker",
+					Args:    []string{"exec", string(data.Pod.UID) + "_dind", "/bin/sh", "-c", initContainer.Command},
 				}
 
-				// Log the init container commands
-				log.G(h.Ctx).Info("\u2705 [POD FLOW] Init containers command list: " + strings.Join(initContainerCommands, ", "))
+				_, err := shell.Execute()
+				if err != nil {
+					HandleErrorAndRemoveData(h, w, "An error occurred during the exec of the init container command", err, "", "")
+					return
+				}
 
-				// Run init containers sequentially
-				for _, initContainer := range initContainers {
-					log.G(h.Ctx).Info("\u2705 [POD FLOW] Executing init container: " + initContainer.Name)
-
-					// Execute the docker command for the current init container
-					shell := exec.ExecTask{
+				// Poll the container status until it exits
+				for {
+					shell = exec.ExecTask{
 						Command: "docker",
-						Args:    []string{"exec", string(data.Pod.UID) + "_dind", "/bin/sh", "-c", initContainer.Command},
+						Args:    []string{"exec", string(data.Pod.UID) + "_dind", "docker", "inspect", "--format='{{.State.Status}}'", initContainer.Name},
 					}
 
-					_, err := shell.Execute()
+					statusReturn, err := shell.Execute()
 					if err != nil {
-						HandleErrorAndRemoveData(h, w, "An error occurred during the exec of the init container command", err, "", "")
+						HandleErrorAndRemoveData(h, w, "An error occurred during inspect of init container", err, "", "")
 						return
 					}
 
-					// Poll the container status until it exits
-					for {
-						shell = exec.ExecTask{
-							Command: "docker",
-							Args:    []string{"exec", string(data.Pod.UID) + "_dind", "docker", "inspect", "--format='{{.State.Status}}'", initContainer.Name},
-						}
-
-						statusReturn, err := shell.Execute()
-						if err != nil {
-							HandleErrorAndRemoveData(h, w, "An error occurred during inspect of init container", err, "", "")
-							return
-						}
-
-						status := strings.Trim(statusReturn.Stdout, "'\n")
-						if status == "exited" {
-							log.G(h.Ctx).Info("\u2705 [POD FLOW] Init container " + initContainer.Name + " has completed")
-							break
-						} else {
-							time.Sleep(1 * time.Second) // Wait for a second before polling again
-						}
+					status := strings.Trim(statusReturn.Stdout, "'\n")
+					if status == "exited" {
+						log.G(h.Ctx).Info("\u2705 [POD FLOW] Init container " + initContainer.Name + " has completed")
+						break
+					} else {
+						time.Sleep(1 * time.Second) // Wait for a second before polling again
 					}
 				}
-
-				log.G(h.Ctx).Info("\u2705 [POD FLOW] All init containers created and executed successfully")
 			}
 
-			// create a file called containers_command.sh and write the containers commands to it, use WriteFile function
-			containersCommand := "#!/bin/sh\n"
+			log.G(h.Ctx).Info("\u2705 [POD FLOW] All init containers created and executed successfully")
+		}
 
-			// if podIpAddress is != "" , add the echo "nameserver 10.0 " > /etc/resolv.conf command to the containers_command.sh
-			if podIpAddress != "" {
-				containersCommand += "echo 'nameserver 10.96.0.10' > /etc/resolv.conf" + "\n"
-			}
+		// create a file called containers_command.sh and write the containers commands to it, use WriteFile function
+		containersCommand := "#!/bin/sh\n"
 
-			for _, container := range containers {
-				containersCommand += container.Command + "\n"
-			}
-			err = os.WriteFile(podDirectoryPath+"/containers_command.sh", []byte(containersCommand), 0644)
-			if err != nil {
-				HandleErrorAndRemoveData(h, w, "An error occurred during the creation of the container commands script.", err, "", "")
-				return
-			}
+		// if podIpAddress is != "" , add the echo "nameserver 10.0 " > /etc/resolv.conf command to the containers_command.sh
+		if podIpAddress != "" {
+			containersCommand += "echo 'nameserver 10.96.0.10' > /etc/resolv.conf" + "\n"
+		}
 
-			log.G(h.Ctx).Info("\u2705 [POD FLOW] Containers commands written to the script file")
+		for _, container := range containers {
+			containersCommand += container.Command + "\n"
+		}
+		err = os.WriteFile(podDirectoryPath+"/containers_command.sh", []byte(containersCommand), 0644)
+		if err != nil {
+			HandleErrorAndRemoveData(h, w, "An error occurred during the creation of the container commands script.", err, "", "")
+			return
+		}
 
-			shell = exec.ExecTask{
-				Command: "docker",
-				Args:    []string{"exec", string(data.Pod.UID) + "_dind", "/bin/sh", podDirectoryPath + "/containers_command.sh"},
-			}
+		log.G(h.Ctx).Info("\u2705 [POD FLOW] Containers commands written to the script file")
 
-			_, err = shell.Execute()
-			if err != nil {
-				HandleErrorAndRemoveData(h, w, "An error occurred during the execution of the container command script", err, "", "")
-				return
-			}
+		shell = exec.ExecTask{
+			Command: "docker",
+			Args:    []string{"exec", string(data.Pod.UID) + "_dind", "/bin/sh", podDirectoryPath + "/containers_command.sh"},
+		}
 
-			log.G(h.Ctx).Info("\u2705 [POD FLOW] Containers created successfully")
-		}()
+		_, err = shell.Execute()
+		if err != nil {
+			HandleErrorAndRemoveData(h, w, "An error occurred during the execution of the container command script", err, "", "")
+			return
+		}
 
-	}
+		log.G(h.Ctx).Info("\u2705 [POD FLOW] Containers created successfully")
+	}()
 
 }
 
